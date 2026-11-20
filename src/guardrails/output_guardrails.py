@@ -12,7 +12,27 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+# Các từ tiếng Anh/Việt thông thường sau "password is ..." (không phải giá trị mật khẩu thật)
+_PASSWORD_PROSE_STOPWORDS = frozenset({
+    "a", "an", "the", "your", "my", "our", "their", "this", "that",
+    "required", "needed", "protected", "encrypted", "confidential", "private",
+    "important", "reset", "changed", "updated", "invalid", "incorrect",
+    "expired", "missing", "never", "not", "stored", "hashed", "mandatory",
+    "optional", "valid", "too", "very", "kept", "safe", "secure", "secret",
+    "bat", "buoc", "bao", "mat", "khong", "duoc", "can", "thiet",
+})
+
+_PASSWORD_ASSIGN_RE = re.compile(
+    r"\b(?:password|passwd|mật\s*khẩu)\s*[:=]\s*[^\s,;]+(?<![.,;])",
+    re.IGNORECASE,
+)
+_PASSWORD_IS_RE = re.compile(
+    r"\b(?:password|passwd|mật\s*khẩu)\s+(?:is|là)\s+(['\"`]?[^\s,;]+(?<![.,;]))",
+    re.IGNORECASE,
+)
 
 
 # ============================================================
@@ -36,24 +56,67 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
-    issues = []
+    if not response or not isinstance(response, str):
+        return {"safe": True, "issues": [], "redacted": response or ""}
+
+    issues: list[str] = []
     redacted = response
 
-    # PII patterns to check
+    # Ordered PII & secret patterns:
+    # - Phone uses exact 10-11 digit VN format starting with 0 (or +84 + 9 digits)
+    #   with digit boundaries so it never collides with 12-digit CCCD or 1900 hotlines.
+    # - National ID matches exact 9-digit CMND or 12-digit CCCD with digit boundaries.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "api_key": r"\bsk-[a-zA-Z0-9_-]{6,}\b",
+        "db_host": r"\b[a-zA-Z0-9.-]+\.internal(?::\d+)?\b",
+        "email": r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b",
+        "phone": r"(?<!\d)(?:\+84\d{9}|0\d{9,10})(?!\d)",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Password leaks: both explicit assignment (password=..., password: ...)
+    # and prose disclosure ("password is admin123"), while avoiding benign prose.
+    password_hits = 0
+
+    def _replace_pw_assign(match: re.Match) -> str:
+        nonlocal password_hits
+        password_hits += 1
+        return "[REDACTED]"
+
+    redacted = _PASSWORD_ASSIGN_RE.sub(_replace_pw_assign, redacted)
+
+    def _replace_pw_is(match: re.Match) -> str:
+        nonlocal password_hits
+        candidate = match.group(1).strip("'\"`()[]")
+        if candidate.lower() in _PASSWORD_PROSE_STOPWORDS:
+            return match.group(0)
+        password_hits += 1
+        return "[REDACTED]"
+
+    redacted = _PASSWORD_IS_RE.sub(_replace_pw_is, redacted)
+
+    if password_hits:
+        issues.append(f"password: {password_hits} found")
+
+    # Catch any remaining literal DEMO secret values loaded from data/protected/vinbank_secrets.json
+    secret_hits = 0
+    for secret in DEMO_SECRETS:
+        if not secret:
+            continue
+        pattern = re.escape(secret)
+        found = re.findall(pattern, redacted, re.IGNORECASE)
+        if found:
+            secret_hits += len(found)
+            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    if secret_hits:
+        issues.append(f"secret: {secret_hits} found")
 
     return {
         "safe": len(issues) == 0,
@@ -166,22 +229,39 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         llm_response,
     ):
         """Check LLM response before sending to user."""
+        _ = callback_context
         self.total_count += 1
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            response_text = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict.get("safe", True):
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I cannot provide that response. "
+                                "How else can I help with your VinBank banking needs?"
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================

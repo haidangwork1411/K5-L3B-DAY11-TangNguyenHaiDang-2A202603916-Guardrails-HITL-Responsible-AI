@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,80 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+# Bổ sung một số từ khóa nghiệp vụ ngân hàng tiếng Anh/Việt phổ biến
+# (không bao gồm tên riêng chung chung như "vinbank" để tránh lọt câu off-topic).
+_SUPPLEMENTARY_BANKING_TOPICS = (
+    "bank transfer",
+    "bank account",
+    "bank statement",
+    "debit",
+    "mortgage",
+    "hotline",
+    "chuyen khoan",
+    "rut tien",
+    "nap tien",
+    "sao ke",
+    "mo the",
+    "khoa the",
+    "the ghi no",
+    "the atm",
+    "so tiet kiem",
+    "khoan vay",
+    "tong dai",
+)
+
+# Regex patterns phát hiện prompt injection / jailbreak (cả EN & VI không dấu)
+_INJECTION_PATTERNS = (
+    r"\bignore\s+(?:all\s+|any\s+)?(?:previous|above|prior|earlier)?\s*"
+    r"(?:instructions?|rules?|prompts?|directives?)\b",
+    r"\b(?:disregard|forget|override|bypass)\s+(?:all\s+|any\s+|your\s+)?"
+    r"(?:previous|above|prior|system)?\s*"
+    r"(?:instructions?|rules?|prompts?|directives?|guardrails?|safety)\b",
+    r"\byou\s+are\s+now\b",
+    r"\bsystem\s+prompt\b|\bdeveloper\s+(?:prompt|instructions?)\b|\bsystem\s+override\b",
+    r"\b(?:reveal|show|print|output|disclose|expose|dump|leak)\s+(?:me\s+)?"
+    r"(?:your\s+|the\s+)?(?:system\s+|internal\s+|hidden\s+)?"
+    r"(?:instructions?|prompt|secrets?|password|api\s*key|credentials?|config)\b",
+    r"\bpretend\s+(?:you\s+are|to\s+be)\b",
+    r"\bact\s+as\s+(?:a\s+|an\s+)?(?:unrestricted|evil|jailbroken|unfiltered|dan\b)",
+    r"\b(?:do\s+anything\s+now|dan\s+mode|jailbreak|developer\s+mode)\b",
+    r"(?:^|\n)\s*(?:system\s*:|\[system\]|<\|?system\|?>|new\s+instructions?\s*:)",
+)
+
+_VI_INJECTION_PATTERNS = (
+    r"\b(?:bo\s+qua|quen|ghi\s+de|vo\s+hieu\s+hoa)\s+(?:moi\s+|tat\s+ca\s+|cac\s+)?"
+    r"(?:huong\s+dan|quy\s+tac|lenh|chi\s+dan)\b",
+    r"\b(?:tiet\s+lo|cho\s+(?:toi\s+)?xem|in\s+ra)\s+"
+    r"(?:mat\s+khau|api\s*key|system\s*prompt|huong\s+dan\s+he\s+thong|thong\s+tin\s+noi\s+bo)\b",
+    r"\bban\s+la\s+dan\b|\bche\s+do\s+khong\s+gioi\s+han\b",
+)
+
+
+def _normalize_unicode(text: str) -> str:
+    """Canonicalize Unicode (NFKC) and strip invisible/format chars (e.g., ZWSP)."""
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    # Remove Unicode format characters (category "Cf"): \u200b, \u200c, \u200d, \u2060, \ufeff, \u00ad...
+    cleaned = "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+    return cleaned
+
+
+def _strip_vietnamese_accents(text: str) -> str:
+    """Convert Vietnamese accented text to ASCII-friendly lowercase form."""
+    if not text:
+        return ""
+    decomposed = unicodedata.normalize("NFD", text)
+    no_marks = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+    return no_marks.replace("đ", "d").replace("Đ", "D")
+
+
+def _has_word_or_phrase(text: str, phrase: str, *, prefix_match: bool = False) -> bool:
+    """Match a keyword/phrase at word boundaries to reduce substring false positives."""
+    escaped = re.escape(phrase.strip())
+    pattern = rf"(?<!\w){escaped}" if prefix_match else rf"(?<!\w){escaped}(?!\w)"
+    return bool(re.search(pattern, text, re.IGNORECASE))
 
 
 # ============================================================
@@ -51,15 +126,20 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
+    if not user_input or not isinstance(user_input, str):
+        return "ALLOW"
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    normalized = _normalize_unicode(user_input)
+    ascii_folded = _strip_vietnamese_accents(normalized)
+
+    for pattern in _INJECTION_PATTERNS:
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
+
+    for pattern in _VI_INJECTION_PATTERNS:
+        if re.search(pattern, ascii_folded, re.IGNORECASE):
+            return "BLOCK"
+
     return "ALLOW"
 
 
@@ -84,14 +164,37 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    if not user_input or not isinstance(user_input, str):
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    normalized = _normalize_unicode(user_input).strip()
+    if not normalized:
+        return "BLOCK"
 
-    pass  # Replace with your implementation
+    lower_norm = normalized.lower()
+    ascii_lower = _strip_vietnamese_accents(lower_norm)
+
+    # 1. Blocked topics take precedence (prefix boundary allows hack/hacking, drug/drugs,
+    #    while avoiding substring false positives like "skill" for "kill").
+    for blocked in BLOCKED_TOPICS:
+        if _has_word_or_phrase(ascii_lower, blocked, prefix_match=True):
+            return "BLOCK"
+
+    # 2. Check configured ALLOWED_TOPICS (+ supplementary banking terms).
+    #    Special-case Vietnamese "vay" (loan) so accented "vậy" (so/thus) does not falsely allow.
+    for topic in ALLOWED_TOPICS:
+        if topic == "vay":
+            if _has_word_or_phrase(lower_norm, "vay"):
+                return "ALLOW"
+            continue
+        if _has_word_or_phrase(ascii_lower, topic):
+            return "ALLOW"
+
+    for topic in _SUPPLEMENTARY_BANKING_TOPICS:
+        if _has_word_or_phrase(ascii_lower, topic):
+            return "ALLOW"
+
+    return "BLOCK"
 
 
 # ============================================================
@@ -141,17 +244,29 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
             None if message is safe (let it through),
             types.Content if message is blocked (return replacement)
         """
+        _ = invocation_context  # May be None in unit tests
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if not text.strip():
+            self.blocked_count += 1
+            return self._block_response(
+                "Please enter a valid VinBank banking question."
+            )
 
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process that request. I only help with VinBank banking questions."
+            )
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related questions."
+            )
+
+        return None
 
 
 # ============================================================
